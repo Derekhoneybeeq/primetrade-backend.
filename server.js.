@@ -5,14 +5,12 @@ const http = require("http");
 const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
+const BINANCE_KEY = process.env.BINANCE_API_KEY;
+const BINANCE_SECRET = process.env.BINANCE_API_SECRET;
+const PRIME_TOKEN = process.env.PRIMETRADE_ACCESS_TOKEN;
+const BINANCE_URL = "https://testnet.binance.vision";
 
-const BINANCE_API_KEY = process.env.BINANCE_API_KEY;
-const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET;
-const PRIME_ACCESS_TOKEN = process.env.PRIMETRADE_ACCESS_TOKEN;
-
-const BINANCE_BASE_URL = "https://testnet.binance.vision";
-
-function sendJson(res, status, data) {
+function reply(res, status, data) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
@@ -20,33 +18,23 @@ function sendJson(res, status, data) {
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type"
   });
-
   res.end(JSON.stringify(data));
 }
 
-function tokenIsValid(req) {
+function validToken(req) {
   const header = req.headers.authorization || "";
-  const prefix = "Bearer ";
+  if (!PRIME_TOKEN || !header.startsWith("Bearer ")) return false;
 
-  if (!PRIME_ACCESS_TOKEN || !header.startsWith(prefix)) {
-    return false;
-  }
+  const provided = Buffer.from(header.slice(7));
+  const expected = Buffer.from(PRIME_TOKEN);
 
-  const supplied = Buffer.from(header.slice(prefix.length));
-  const expected = Buffer.from(PRIME_ACCESS_TOKEN);
-
-  if (supplied.length !== expected.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(supplied, expected);
+  return provided.length === expected.length &&
+    crypto.timingSafeEqual(provided, expected);
 }
 
-async function getBinanceAccount() {
-  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
-    throw new Error(
-      "Binance credentials are missing from Render environment variables"
-    );
+async function fetchAccount() {
+  if (!BINANCE_KEY || !BINANCE_SECRET) {
+    throw new Error("Binance API credentials are missing in Render");
   }
 
   const params = new URLSearchParams({
@@ -55,56 +43,41 @@ async function getBinanceAccount() {
   });
 
   const signature = crypto
-    .createHmac("sha256", BINANCE_API_SECRET)
+    .createHmac("sha256", BINANCE_SECRET)
     .update(params.toString())
     .digest("hex");
 
-  const url =
-    BINANCE_BASE_URL +
-    "/api/v3/account?" +
-    params.toString() +
-    "&signature=" +
-    signature;
+  const url = BINANCE_URL + "/api/v3/account?" +
+    params.toString() + "&signature=" + signature;
 
   const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "X-MBX-APIKEY": BINANCE_API_KEY
-    },
+    headers: { "X-MBX-APIKEY": BINANCE_KEY },
     signal: AbortSignal.timeout(10000)
   });
 
   const data = await response.json();
 
   if (!response.ok) {
-    const error = new Error(
-      data.msg || "Binance account request failed"
-    );
-    error.status = response.status;
-    throw error;
+    throw new Error(data.msg || "Binance rejected the account request");
   }
 
   return data;
 }
 
 const server = http.createServer(async (req, res) => {
+  const pathname = new URL(req.url, "http://localhost").pathname;
+
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Authorization, Content-Type",
-      "Access-Control-Max-Age": "600"
+      "Access-Control-Allow-Headers": "Authorization, Content-Type"
     });
     return res.end();
   }
 
-  const pathname = new URL(
-    req.url,
-    "http://localhost"
-  ).pathname;
-
   if (req.method === "GET" && pathname === "/health") {
-    return sendJson(res, 200, {
+    return reply(res, 200, {
       app: "PrimeTrade",
       status: "online",
       mode: "testnet",
@@ -113,29 +86,26 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && pathname === "/api/account") {
-    if (!PRIME_ACCESS_TOKEN) {
-      return sendJson(res, 503, {
-        error: "PrimeTrade access token is not configured on the server"
+    if (!PRIME_TOKEN) {
+      return reply(res, 503, {
+        error: "PrimeTrade access token is not configured"
       });
     }
 
-    if (!tokenIsValid(req)) {
-      return sendJson(res, 401, {
+    if (!validToken(req)) {
+      return reply(res, 401, {
         error: "Unauthorized",
         message: "A valid PrimeTrade access token is required"
       });
     }
 
     try {
-      const account = await getBinanceAccount();
+      const account = await fetchAccount();
+      const balances = (account.balances || []).filter(
+        b => Number(b.free) > 0 || Number(b.locked) > 0
+      );
 
-      const balances = (account.balances || [])
-        .filter(item =>
-          Number(item.free) > 0 ||
-          Number(item.locked) > 0
-        );
-
-      return sendJson(res, 200, {
+      return reply(res, 200, {
         app: "PrimeTrade",
         connected: true,
         mode: "testnet",
@@ -145,26 +115,16 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (error) {
       console.error("Account request failed:", error.message);
-
-      const message =
-        error.name === "TimeoutError"
-          ? "Binance request timed out. Please try again."
-          : error.message;
-
-      return sendJson(res, 502, {
+      return reply(res, 502, {
         error: "Binance account request failed",
-        message
+        message: error.message
       });
     }
   }
 
-  return sendJson(res, 404, {
-    error: "Endpoint not found"
-  });
+  return reply(res, 404, { error: "Endpoint not found" });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    "PrimeTrade backend listening on port " + PORT
-  );
+  console.log("PrimeTrade backend listening on " + PORT);
 });
